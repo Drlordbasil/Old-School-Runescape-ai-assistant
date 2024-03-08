@@ -3,6 +3,7 @@ import requests
 import json
 import numpy as np
 import pickle
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
@@ -14,13 +15,14 @@ from kivy.core.window import Window
 from kivy.utils import get_color_from_hex
 from kivy.properties import StringProperty
 from threading import Thread
-from openai import OpenAI
-
-client = OpenAI()
+from kivy.core.clipboard import Clipboard
 
 class OSRSGrandExchangeApp(App):
     suggestions_text = StringProperty("")
-    advice_text = StringProperty("")
+
+    def copy_to_clipboard(self, instance):
+        text_to_copy = f"Item Suggestions:\n{self.suggestions_text}"
+        Clipboard.copy(text_to_copy)
 
     def build(self):
         self.title = "OSRS Grand Exchange Helper"
@@ -42,19 +44,19 @@ class OSRSGrandExchangeApp(App):
         self.fetch_button.bind(on_press=self.fetch_prices_and_generate_suggestions)
         self.train_button = Button(text="Train Model", size_hint=(0.3, None), height=50, background_color=get_color_from_hex("#2196F3"), color=get_color_from_hex("#FFFFFF"), bold=True)
         self.train_button.bind(on_press=self.train_model)
+        self.copy_button = Button(text="Copy to Clipboard", size_hint=(0.3, None), height=50, background_color=get_color_from_hex("#FFC107"), color=get_color_from_hex("#FFFFFF"), bold=True)
+        self.copy_button.bind(on_press=self.copy_to_clipboard)
         button_layout.add_widget(self.fetch_button)
         button_layout.add_widget(self.train_button)
+        button_layout.add_widget(self.copy_button)
         layout.add_widget(button_layout)
 
         scroll_view = ScrollView(size_hint=(1, 1))
         scroll_layout = BoxLayout(orientation="vertical", spacing=10, size_hint_y=None)
         scroll_layout.bind(minimum_height=scroll_layout.setter("height"))
 
-        self.suggestions_label = Label(text="Item Suggestions:", size_hint_y=None, height=200, color=get_color_from_hex("#FFFFFF"), text_size=(Window.width - 40, None), halign="left", valign="top")
+        self.suggestions_label = Label(text="Item Suggestions:", size_hint_y=None, height=400, color=get_color_from_hex("#FFFFFF"), text_size=(Window.width - 40, None), halign="left", valign="top")
         scroll_layout.add_widget(self.suggestions_label)
-
-        self.advice_label = Label(text="Trading Advice:", size_hint_y=None, height=300, color=get_color_from_hex("#FFFFFF"), text_size=(Window.width - 40, None), halign="left", valign="top")
-        scroll_layout.add_widget(self.advice_label)
 
         scroll_view.add_widget(scroll_layout)
         layout.add_widget(scroll_view)
@@ -72,19 +74,13 @@ class OSRSGrandExchangeApp(App):
         scraper = OSRSScraper()
         items_data = scraper.scrape_data()
         if items_data:
-            suggestions = generate_item_suggestions(items_data)
+            suggestions = generate_item_suggestions(items_data, starting_gold)
             if suggestions:
-                formatted_prompt = format_data_for_prompt(suggestions)
-                advisor = OpenAI_Advisor()
-                response = advisor.response(formatted_prompt, starting_gold)
                 self.suggestions_text = f"Item Suggestions:\n{format_suggestions(suggestions)}"
-                self.advice_text = f"Trading Advice:\n{response}"
             else:
                 self.suggestions_text = "No item suggestions found."
-                self.advice_text = ""
         else:
             self.suggestions_text = "Error fetching item prices or item mapping."
-            self.advice_text = ""
         self.fetch_button.disabled = False
 
     def train_model(self, instance):
@@ -126,14 +122,10 @@ class OSRSGrandExchangeApp(App):
         self.suggestions_label.texture_update()
         self.suggestions_label.height = self.suggestions_label.texture_size[1]
 
-    def on_advice_text(self, instance, value):
-        self.advice_label.text = value
-        self.advice_label.texture_update()
-        self.advice_label.height = self.advice_label.texture_size[1]
-
 class OSRSScraper:
     def __init__(self):
         self.item_names = self.fetch_item_names()
+        self.buy_limits = self.fetch_buy_limits()
         self.MIN_PROFIT = 3
         self.MIN_FLUCTUATION = 0
         self.MIN_ROI = 0
@@ -159,6 +151,16 @@ class OSRSScraper:
             for item in mapping_data:
                 item_names[str(item['id'])] = item['name']
         return item_names
+
+    def fetch_buy_limits(self):
+        buy_limits_url = "https://prices.runescape.wiki/api/v1/osrs/mapping"
+        response = requests.get(buy_limits_url)
+        buy_limits = {}
+        if response.status_code == 200:
+            buy_limits_data = response.json()
+            for item in buy_limits_data:
+                buy_limits[str(item['id'])] = item.get('limit', 0)
+        return buy_limits
 
     def scrape_data(self):
         data_latest = self.fetch_data(self.api_url_latest)
@@ -199,6 +201,7 @@ class OSRSScraper:
                                 and buy_volume >= self.MIN_BUY_VOLUME
                             ):
                                 item_name = self.item_names.get(item_id, "Unknown Item")
+                                buy_limit = self.buy_limits.get(item_id, 0)
                                 item_data = {
                                     "Item ID": item_id,
                                     "Item Name": item_name,
@@ -210,6 +213,7 @@ class OSRSScraper:
                                     "ROI": roi,
                                     "Potential Profit": potential_profit,
                                     "Price Fluctuation": fluctuation * 100,
+                                    "Buy Limit": buy_limit,
                                 }
                                 items_data.append(item_data)
         else:
@@ -218,42 +222,7 @@ class OSRSScraper:
 
         return items_data
 
-class OpenAI_Advisor:
-    def response(self, prompt, starting_gold):
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""
-                    You are a helpful assistant that receives data from Old School Runescape GE with profit and prices.
-                      You currently have {starting_gold} gold pieces.
-
-                      You only reply with what to buy, how many and for how much each, alongside how much to sell for within your budget.
-                        You can't tell them to buy more than they can afford.
-                        You can't tell them to buy more than the GE stock.
-
-                     Structure your response as follows:
-                        1. (first item)"Buy <suggested amount> of <item name> for <suggested buy price> each and sell for <suggested sell price> each, with a total profit of <total_profit>"
-                        2. (second item)"Buy <suggested amount> of <item name> for <suggested buy price> each and sell for <suggested sell price> each, with a total profit of <total_profit>"
-                        3. (third item)"Buy <suggested amount> of <item name> for <suggested buy price> each and sell for <suggested sell price> each, with a total profit of <total_profit>"
-                        4. (fourth item)"Buy <suggested amount> of <item name> for <suggested buy price> each and sell for <suggested sell price> each, with a total profit of <total_profit>"
-                        5. (fifth item)"Buy <suggested amount> of <item name> for <suggested buy price> each and sell for <suggested sell price> each, with a total profit of <total_profit>"
-                    """,
-                },
-                {"role": "user", "content": "What should I buy? " + prompt},
-            ],
-        )
-        return response.choices[0].message.content
-
-def format_data_for_prompt(items_data):
-    formatted_items = []
-    for item in items_data:
-        formatted_item = f"Item ID: {item['Item ID']}, Item Name: {item['Item Name']}, High (Sell): {item['High (Sell)']}, Low (Buy): {item['Low (Buy)']}, Potential Profit: {item['Potential Profit']}, ROI: {item['ROI']}, Price Fluctuation: {item['Price Fluctuation']}%"
-        formatted_items.append(formatted_item)
-    return "\n".join(formatted_items)
-
-def generate_item_suggestions(items_data):
+def generate_item_suggestions(items_data, starting_gold):
     model_file = "model.pkl"
     if os.path.exists(model_file):
         with open(model_file, "rb") as file:
@@ -262,30 +231,47 @@ def generate_item_suggestions(items_data):
         model = RandomForestRegressor(n_estimators=100, random_state=42)
 
     X, _ = prepare_training_data(items_data)
-    predictions = model.predict(X)
+    X_normalized = StandardScaler().fit_transform(X)
+    predictions = model.predict(X_normalized)
 
     suggestions = []
     for i, item in enumerate(items_data):
         prediction = predictions[i]
         if prediction > 0:
             item["Predicted Profit"] = prediction
+            buy_limit = item["Buy Limit"]
+            buy_price = item["Low (Buy)"]
+            max_quantity = min(buy_limit, starting_gold // buy_price)
+            item["Max Quantity"] = max_quantity
             suggestions.append(item)
 
     suggestions.sort(key=lambda x: x["Predicted Profit"], reverse=True)
-    return suggestions[:3]
+    return suggestions[:5]
 
 def prepare_training_data(items_data):
     X = []
     y = []
     for item in items_data:
-        X.append([item["High (Sell)"], item["Low (Buy)"], item["High Volume"], item["Low Volume"], item["5-Minute Average High Price"], item["Price Fluctuation"]])
+        X.append([
+            item["High (Sell)"],
+            item["Low (Buy)"],
+            item["High Volume"],
+            item["Low Volume"],
+            item["5-Minute Average High Price"],
+            item["Price Fluctuation"],
+            item["Buy Limit"],
+            item["ROI"]
+        ])
         y.append(item["Potential Profit"])
-    return X, y
+
+    X_normalized = StandardScaler().fit_transform(X)
+    y_log_transformed = np.log1p(y)
+    return X_normalized, y_log_transformed
 
 def format_suggestions(suggestions):
     formatted_suggestions = []
     for suggestion in suggestions:
-        formatted_suggestion = f"- {suggestion['Item Name']}\n  Buy Price: {suggestion['Low (Buy)']}\n  Sell Price: {suggestion['High (Sell)']}\n  Potential Profit: {suggestion['Potential Profit']} per item\n"
+        formatted_suggestion = f"- {suggestion['Item Name']}\n  Buy Price: {suggestion['Low (Buy)']}\n  Sell Price: {suggestion['High (Sell)']}\n  Potential Profit: {suggestion['Potential Profit']} per item\n  Buy Limit: {suggestion['Buy Limit']}\n  Max Quantity: {suggestion['Max Quantity']}\n"
         formatted_suggestions.append(formatted_suggestion)
     return "\n".join(formatted_suggestions)
 
